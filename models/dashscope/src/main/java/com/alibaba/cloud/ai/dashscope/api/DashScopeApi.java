@@ -22,6 +22,8 @@ import com.alibaba.cloud.ai.dashscope.rag.DashScopeDocumentTransformerOptions;
 import com.alibaba.cloud.ai.dashscope.rag.DashScopeStoreOptions;
 import com.alibaba.cloud.ai.dashscope.spec.DashScopeApiSpec;
 import com.alibaba.cloud.ai.dashscope.spec.DashScopeModel;
+import com.aliyun.msea.ai.framework.common.utils.Utils;
+import com.aliyun.msea.ai.framework.llm.configuration.ApiKeySelector;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
@@ -56,7 +58,9 @@ import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -202,9 +206,20 @@ public class DashScopeApi {
         Assert.isTrue(!CollectionUtils.isEmpty(embeddingRequest.input().texts()), "The input texts can not be empty.");
         Assert.isTrue(embeddingRequest.input().texts().size() <= 25, "The input texts limit 25.");
 
+        // modified by liufy 动态换apiKey
+        MultiValueMap<String, String> additionalHttpHeader = new LinkedMultiValueMap<>();
+        Map<String, String> apiKeyHeaders = ApiKeySelector.INST.getApiKeyHeaders(embeddingRequest.model());
+        for (Map.Entry<String, String> entry : apiKeyHeaders.entrySet()) {
+            additionalHttpHeader.add(entry.getKey(), entry.getValue());
+        }
+
         return this.restClient.post()
                 .uri(this.embeddingsPath)
-                .headers(this::addDefaultHeadersIfMissing)
+                // modified by liufy 动态换apiKey
+                .headers(headers -> {
+                    headers.addAll(additionalHttpHeader);
+                    addDefaultHeadersIfMissing(headers);
+                })
                 .body(embeddingRequest)
                 .retrieve()
                 .toEntity(DashScopeApiSpec.EmbeddingList.class);
@@ -345,8 +360,14 @@ public class DashScopeApi {
 			});
 	}
 
+    private static final Map<String, String> PIPELINE_ID_MAP = new ConcurrentHashMap<>();
 	public String getPipelineIdByName(String pipelineName) {
-		ResponseEntity<DashScopeApiSpec.QueryPipelineResponse> startPipelineResponse = this.restClient.get()
+        // modified by liufy 缓存ID
+        if (PIPELINE_ID_MAP.get(pipelineName) != null) {
+            return PIPELINE_ID_MAP.get(pipelineName);
+        }
+
+        ResponseEntity<DashScopeApiSpec.QueryPipelineResponse> startPipelineResponse = this.restClient.get()
 			.uri(ub -> ub.path(PIPELINE_SIMPLE_RESTFUL_URL).queryParam("pipeline_name", pipelineName).build())
 			.retrieve()
 			.toEntity(DashScopeApiSpec.QueryPipelineResponse.class);
@@ -507,6 +528,12 @@ public class DashScopeApi {
 			chatCompletionUri = MULTIMODAL_GENERATION_RESTFUL_URL;
 		}
 
+        // modified by liufy 动态换apiKey
+        Map<String, String> apiKeyHeaders = ApiKeySelector.INST.getApiKeyHeaders(chatRequest.model());
+        for (Map.Entry<String, String> entry : apiKeyHeaders.entrySet()) {
+            additionalHttpHeader.add(entry.getKey(), entry.getValue());
+        }
+
 		// @formatter:off
 		return this.restClient.post()
 				.uri(chatCompletionUri)
@@ -558,10 +585,17 @@ public class DashScopeApi {
 		DashScopeAiStreamFunctionCallingHelper chunkMerger = new DashScopeAiStreamFunctionCallingHelper(
 				incrementalOutput);
 
-		var chatCompletionUri = this.completionsPath;
-		if (chatRequest.multiModel()) {
-			chatCompletionUri = MULTIMODAL_GENERATION_RESTFUL_URL;
-		}
+        // modified by liufy 加随机request-id参数，为了和百炼mse网关排查问题
+        var chatCompletionUri = this.completionsPath + "?X-Request-Id=" + Utils.generateToken();
+        if (chatRequest.multiModel()) {
+            chatCompletionUri = MULTIMODAL_GENERATION_RESTFUL_URL;
+        }
+
+        // modified by liufy 添加header, 动态选择apiKey
+        Map<String, String> apiKeyHeaders = ApiKeySelector.INST.getApiKeyHeaders(chatRequest.model());
+        for (Map.Entry<String, String> entry : apiKeyHeaders.entrySet()) {
+            additionalHttpHeader.add(entry.getKey(), entry.getValue());
+        }
 
 		return this.webClient.post().uri(chatCompletionUri).headers(headers -> {
 			headers.addAll(additionalHttpHeader);

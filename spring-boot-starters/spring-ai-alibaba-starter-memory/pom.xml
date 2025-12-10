@@ -20,7 +20,7 @@
     <parent>
         <groupId>com.alibaba.cloud.ai</groupId>
         <artifactId>spring-ai-alibaba-extensions</artifactId>
-        <version>${revision}</version>
+        <version>1.1.0.0-msea-SNAPSHOT</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
 
@@ -57,13 +57,13 @@
         <dependency>
             <groupId>com.alibaba.cloud.ai</groupId>
             <artifactId>spring-ai-alibaba-autoconfigure-memory</artifactId>
-            <version>${revision}</version>
+            <version>1.1.0.0-msea-SNAPSHOT</version>
         </dependency>
 
         <dependency>
             <groupId>com.alibaba.cloud.ai</groupId>
             <artifactId>spring-ai-alibaba-starter-memory-jdbc</artifactId>
-            <version>${revision}</version>
+            <version>1.1.0.0-msea-SNAPSHOT</version>
         </dependency>
 
         <!--        <dependency>-->
@@ -75,13 +75,13 @@
         <dependency>
             <groupId>com.alibaba.cloud.ai</groupId>
             <artifactId>spring-ai-alibaba-starter-memory-redis</artifactId>
-            <version>${revision}</version>
+            <version>1.1.0.0-msea-SNAPSHOT</version>
         </dependency>
 
         <dependency>
             <groupId>com.alibaba.cloud.ai</groupId>
             <artifactId>spring-ai-alibaba-starter-memory-tablestore</artifactId>
-            <version>${revision}</version>
+            <version>1.1.0.0-msea-SNAPSHOT</version>
         </dependency>
 
         <!--        <dependency>-->
@@ -92,7 +92,7 @@
         <dependency>
             <groupId>com.alibaba.cloud.ai</groupId>
             <artifactId>spring-ai-alibaba-starter-memory-elasticsearch</artifactId>
-            <version>${revision}</version>
+            <version>1.1.0.0-msea-SNAPSHOT</version>
         </dependency>
 
         <dependency>
