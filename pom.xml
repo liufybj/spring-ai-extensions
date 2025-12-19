@@ -25,7 +25,7 @@
 
     <groupId>com.alibaba.cloud.ai</groupId>
     <artifactId>spring-ai-alibaba-extensions</artifactId>
-    <version>1.1.0.0-msea-SNAPSHOT</version>
+    <version>1.1.0-msea</version>
 
     <packaging>pom</packaging>
     <name>Spring AI Extensions</name>
