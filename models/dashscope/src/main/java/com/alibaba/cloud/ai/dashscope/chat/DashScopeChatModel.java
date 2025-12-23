@@ -361,10 +361,11 @@ public class DashScopeChatModel implements ChatModel {
 						logger.warn("Filtering out toolCall with null function: {}", toolCall);
 						return false;
 					}
-					if (toolCall.function().name() == null) {
-						logger.warn("Filtering out toolCall with null function name: {}", toolCall);
-						return false;
-					}
+					// modified by liufy 注释掉，支持工具调用流式输出
+//					if (toolCall.function().name() == null) {
+//						logger.warn("Filtering out toolCall with null function name: {}", toolCall);
+//						return false;
+//					}
 					return true;
 				})
 					.map(toolCall -> new AssistantMessage.ToolCall(toolCall.id(), "function",
