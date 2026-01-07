@@ -75,12 +75,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
-import java.util.ArrayList;
-import java.util.Base64;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
@@ -256,7 +251,26 @@ public class DashScopeChatModel implements ChatModel {
 			// the function call handling logic.
 			Flux<ChatResponse> chatResponse = completionChunks.map(this::chunkToChatCompletion)
 				.switchMap(chatCompletion -> Mono.just(chatCompletion)
-					.map(chatCompletion2 -> toChatResponse(chatCompletion2, previousChatResponse, request, roleMap)));
+					.map(chatCompletion2 -> toChatResponse(chatCompletion2, previousChatResponse, request, roleMap)))
+					.filter(response -> {
+						if (response == null) {
+							return false;
+						}
+						if (response.hasToolCalls()) {
+							if (ToolCallingChatOptions.isInternalToolExecutionEnabled(prompt.getOptions())) {
+								if (org.apache.commons.lang3.StringUtils.isNotEmpty(response.getResults().get(0).getOutput().getToolCalls().get(0).name())
+										&& response.hasFinishReasons(Set.of("TOOL_CALLS", "TOOL_CALL"))) {
+									return true;
+								} else {
+									return false;
+								}
+							} else {
+								return true;
+							}
+						} else {
+							return true;
+						}
+					});
 
 			// @formatter:off
 			Flux<ChatResponse> flux = chatResponse.flatMap(response -> {
