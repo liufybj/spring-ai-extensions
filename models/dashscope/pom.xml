@@ -20,7 +20,7 @@
     <parent>
         <groupId>com.alibaba.cloud.ai</groupId>
         <artifactId>spring-ai-alibaba-extensions</artifactId>
-        <version>${revision}</version>
+        <version>1.1.2-msea-SNAPSHOT</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
     <artifactId>spring-ai-alibaba-dashscope</artifactId>
@@ -55,6 +55,12 @@
     </scm>
 
     <dependencies>
+        <dependency>
+            <groupId>com.aliyun.msea</groupId>
+            <artifactId>msea-ai-framework</artifactId>
+            <version>1.2.1</version>
+            <scope>provided</scope>
+        </dependency>
         <dependency>
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-commons</artifactId>

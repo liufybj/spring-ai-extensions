@@ -121,7 +121,7 @@ spring:
               grant-type: client_credentials
               scope: read,write
             token-cache:
-              enabled: true 
+              enabled: true
               max-size: 1000
               refresh-before-expiry: PT5M
             retry:
@@ -191,7 +191,7 @@ spring:
 <dependency>
     <groupId>com.alibaba.cloud.ai</groupId>
     <artifactId>spring-ai-alibaba-mcp-router</artifactId>
-    <version>${revision}</version>
+    <version>1.1.0.0-msea-SNAPSHOT</version>
 </dependency>
 ```
 
