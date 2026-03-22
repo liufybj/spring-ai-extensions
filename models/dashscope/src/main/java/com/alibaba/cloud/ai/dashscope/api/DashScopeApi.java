@@ -22,8 +22,10 @@ import com.alibaba.cloud.ai.dashscope.rag.DashScopeDocumentTransformerOptions;
 import com.alibaba.cloud.ai.dashscope.rag.DashScopeStoreOptions;
 import com.alibaba.cloud.ai.dashscope.spec.DashScopeApiSpec;
 import com.alibaba.cloud.ai.dashscope.spec.DashScopeModel;
+import com.aliyun.domain.monitor.executor.TransmittableEagleEyeTool;
 import com.aliyun.msea.ai.framework.common.utils.Utils;
 import com.aliyun.msea.ai.framework.llm.configuration.ApiKeySelector;
+import lombok.extern.slf4j.Slf4j;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
@@ -50,12 +52,15 @@ import org.springframework.web.client.ResponseErrorHandler;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.ConnectableFlux;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
 
 import java.io.File;
 import java.net.URI;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -95,6 +100,7 @@ import static com.alibaba.cloud.ai.dashscope.common.DashScopeApiConstants.UPLOAD
  * @author YunKui Lu
  * @since 1.0.0-M2
  */
+@Slf4j
 public class DashScopeApi {
 
     private static final Predicate<String> SSE_DONE_PREDICATE = "[DONE]"::equals;
@@ -583,14 +589,6 @@ public class DashScopeApi {
         Assert.notNull(chatRequest, "The request body can not be null.");
         Assert.isTrue(chatRequest.stream(), "Request must set the stream property to true.");
 
-        AtomicBoolean isInsideTool = new AtomicBoolean(false);
-        final AtomicReference<DashScopeApiSpec.ChatCompletionChunk> preChunk = new AtomicReference<>(new DashScopeApiSpec.ChatCompletionChunk(null, null, null, null));
-
-        boolean incrementalOutput = chatRequest.parameters() != null
-                && chatRequest.parameters().incrementalOutput() != null && chatRequest.parameters().incrementalOutput();
-        DashScopeAiStreamFunctionCallingHelper chunkMerger = new DashScopeAiStreamFunctionCallingHelper(
-                incrementalOutput);
-
         // modified by liufy 加随机request-id参数，为了和百炼mse网关排查问题
         var chatCompletionUri = this.completionsPath + "?X-Request-Id=" + Utils.generateToken();
         if (chatRequest.multiModel()) {
@@ -603,11 +601,25 @@ public class DashScopeApi {
             additionalHttpHeader.add(entry.getKey(), entry.getValue());
         }
 
-        return this.webClient.post().uri(chatCompletionUri).headers(headers -> {
-                    headers.addAll(additionalHttpHeader);
-                    // For DashScope stream
-                    headers.add(HEADER_SSE, ENABLED);
-                    addDefaultHeadersIfMissing(headers);
+        // 全链路日志
+        TransmittableEagleEyeTool transmittableEagleEyeTool = new TransmittableEagleEyeTool();
+
+        // Use Flux.defer to ensure each retry attempt creates fresh state and a new HTTP request
+        String finalChatCompletionUri = chatCompletionUri;
+        return Flux.defer(() -> {
+            AtomicBoolean isInsideTool = new AtomicBoolean(false);
+            final AtomicReference<DashScopeApiSpec.ChatCompletionChunk> preChunk = new AtomicReference<>(new DashScopeApiSpec.ChatCompletionChunk(null, null, null, null));
+
+            boolean incrementalOutput = chatRequest.parameters() != null
+                    && chatRequest.parameters().incrementalOutput() != null && chatRequest.parameters().incrementalOutput();
+            DashScopeAiStreamFunctionCallingHelper chunkMerger = new DashScopeAiStreamFunctionCallingHelper(
+                    incrementalOutput);
+
+            return this.webClient.post().uri(finalChatCompletionUri).headers(headers -> {
+                        headers.addAll(additionalHttpHeader);
+                        // For DashScope stream
+                        headers.add(HEADER_SSE, ENABLED);
+                        addDefaultHeadersIfMissing(headers);
                 })
                 .body(Mono.just(chatRequest), DashScopeApiSpec.ChatCompletionRequest.class)
                 .retrieve()
@@ -648,10 +660,13 @@ public class DashScopeApi {
 //				return List.of(monoChunk);
 //			})
 //			.flatMap(mono -> mono);
-                .index()
-                .concatMap((tuple) -> {
+                .doOnNext(chunk -> {
+                    // 传递父线程的全链路业务日志的上下文
+                    transmittableEagleEyeTool.restoreContext();
+                })
+                .concatMap((chunk) -> {
                     // 当前chunk
-                    DashScopeApiSpec.ChatCompletionChunk chunk = tuple.getT2();
+                    log.info("received chunk：{}", chunk);
 
                     // 开始工具调用
                     if (chunkMerger.isStreamingToolFunctionCall(chunk)) {
@@ -663,6 +678,7 @@ public class DashScopeApi {
                     }
 
                     if (isInsideTool.get()) {
+//                        chunk = createNewChunkFrom(chunk);
                         // 在工具调用内部，合并 chunk
                         preChunk.set(chunkMerger.merge(preChunk.get(), chunk));
 
@@ -678,6 +694,93 @@ public class DashScopeApi {
                         return Mono.just(chunk);
                     }
                 });
+        }).retryWhen(Retry.fixedDelay(30, Duration.ofSeconds(1)) // 最多重试30次，每次间隔1秒
+                .filter(throwable -> throwable instanceof WebClientResponseException.TooManyRequests || throwable instanceof WebClientResponseException.InternalServerError)
+                .doBeforeRetry(signal -> log.warn("Stream rate limited (429 Too Many Requests), retrying attempt: {}", signal.totalRetries() + 1)));
+    }
+
+    /**
+     * Creates a new chunk based on the input chunk, copying all fields and creating new instances
+     * for nested structures like output, choices, message, and toolCalls.
+     *
+     * @param originalChunk The original chunk to copy from
+     * @return A new chunk with copied content
+     */
+    private DashScopeApiSpec.ChatCompletionChunk createNewChunkFrom(DashScopeApiSpec.ChatCompletionChunk originalChunk) {
+        if (originalChunk == null) {
+            return null;
+        }
+
+        // Extract original values
+        String requestId = originalChunk.requestId();
+        DashScopeApiSpec.TokenUsage usage = originalChunk.usage();
+        Object o = originalChunk.o();
+
+        // Process output if it exists
+        DashScopeApiSpec.ChatCompletionOutput newOutput = null;
+        if (originalChunk.output() != null) {
+            String originalText = originalChunk.output().text();
+
+            // Process choices if they exist
+            List<DashScopeApiSpec.ChatCompletionOutput.Choice> newChoices = null;
+            if (originalChunk.output().choices() != null) {
+                newChoices = new ArrayList<>();
+
+                for (DashScopeApiSpec.ChatCompletionOutput.Choice originalChoice : originalChunk.output().choices()) {
+                    DashScopeApiSpec.ChatCompletionFinishReason finishReason = originalChoice.finishReason();
+
+                    // Process message if it exists
+                    DashScopeApiSpec.ChatCompletionMessage newMessage = null;
+                    if (originalChoice.message() != null) {
+                        Object rawContent = originalChoice.message().rawContent();
+                        DashScopeApiSpec.ChatCompletionMessage.Role role = originalChoice.message().role();
+                        String name = originalChoice.message().name();
+                        String toolCallId = originalChoice.message().toolCallId();
+
+                        // Process toolCalls if they exist
+                        List<DashScopeApiSpec.ChatCompletionMessage.ToolCall> newToolCalls = null;
+                        if (originalChoice.message().toolCalls() != null) {
+                            newToolCalls = new ArrayList<>();
+
+                            for (DashScopeApiSpec.ChatCompletionMessage.ToolCall originalToolCall : originalChoice.message().toolCalls()) {
+                                String id = originalToolCall.id();
+                                String type = originalToolCall.type();
+
+                                // Process function if it exists
+                                DashScopeApiSpec.ChatCompletionMessage.ChatCompletionFunction newFunction = null;
+                                if (originalToolCall.function() != null) {
+                                    String functionName = originalToolCall.function().name();
+                                    String functionArguments = originalToolCall.function().arguments();
+                                    functionArguments = functionArguments == null ? null :functionArguments.replace("\n", "\\n");
+
+                                    // Create new function with copied values
+                                    newFunction = new DashScopeApiSpec.ChatCompletionMessage.ChatCompletionFunction(functionName, functionArguments);
+                                }
+
+                                // Create new tool call with copied values
+                                DashScopeApiSpec.ChatCompletionMessage.ToolCall newToolCall = new DashScopeApiSpec.ChatCompletionMessage.ToolCall(id, type, newFunction, originalToolCall.index());
+                                newToolCalls.add(newToolCall);
+                            }
+                        }
+
+                        // Create new message with copied values
+                        newMessage = new DashScopeApiSpec.ChatCompletionMessage(rawContent, role, name, toolCallId, newToolCalls,
+                                originalChoice.message().reasoningContent(), originalChoice.message().partial(), originalChoice.message().phase(),
+                                originalChoice.message().annotations(), originalChoice.message().status());
+                    }
+
+                    // Create new choice with copied values
+                    DashScopeApiSpec.ChatCompletionOutput.Choice newChoice = new DashScopeApiSpec.ChatCompletionOutput.Choice(finishReason, newMessage, originalChoice.logprobs());
+                    newChoices.add(newChoice);
+                }
+            }
+
+            // Create new output with copied values
+            newOutput = new DashScopeApiSpec.ChatCompletionOutput(originalText, newChoices, originalChunk.output().searchInfo());
+        }
+
+        // Create and return new chunk
+        return new DashScopeApiSpec.ChatCompletionChunk(requestId, newOutput, usage, o);
     }
 
     /**
