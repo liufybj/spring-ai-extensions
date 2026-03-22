@@ -22,6 +22,10 @@ import com.alibaba.cloud.ai.dashscope.rag.DashScopeDocumentTransformerOptions;
 import com.alibaba.cloud.ai.dashscope.rag.DashScopeStoreOptions;
 import com.alibaba.cloud.ai.dashscope.spec.DashScopeApiSpec;
 import com.alibaba.cloud.ai.dashscope.spec.DashScopeModel;
+import com.aliyun.domain.monitor.executor.TransmittableEagleEyeTool;
+import com.aliyun.msea.ai.framework.common.utils.Utils;
+import com.aliyun.msea.ai.framework.llm.configuration.ApiKeySelector;
+import lombok.extern.slf4j.Slf4j;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
@@ -50,18 +54,25 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.http.client.reactive.ClientHttpConnector;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.core.publisher.ConnectableFlux;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.util.retry.Retry;
 
 import java.io.File;
 import java.time.Duration;
 import java.net.URI;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -92,16 +103,17 @@ import static com.alibaba.cloud.ai.dashscope.common.DashScopeApiConstants.UPLOAD
  * @author YunKui Lu
  * @since 1.0.0-M2
  */
+@Slf4j
 public class DashScopeApi {
 
-	private static final Predicate<String> SSE_DONE_PREDICATE = "[DONE]"::equals;
+    private static final Predicate<String> SSE_DONE_PREDICATE = "[DONE]"::equals;
 
-	// Store config fields for mutate/copy
-	private final String baseUrl;
+    // Store config fields for mutate/copy
+    private final String baseUrl;
 
-	private final ApiKey apiKey;
+    private final ApiKey apiKey;
 
-	private final String completionsPath;
+    private final String completionsPath;
 
 	private final String workSpaceId;
 
@@ -111,20 +123,20 @@ public class DashScopeApi {
 
 	private final MultiValueMap<String, String> headers;
 
-	/**
-	 * Default chat model
-	 */
-	public static final String DEFAULT_CHAT_MODEL = DashScopeModel.ChatModel.QWEN_PLUS.getValue();
+    /**
+     * Default chat model
+     */
+    public static final String DEFAULT_CHAT_MODEL = DashScopeModel.ChatModel.QWEN_PLUS.getValue();
 
-	public static final String DEFAULT_EMBEDDING_MODEL = DashScopeModel.EmbeddingModel.EMBEDDING_V2.getValue();
+    public static final String DEFAULT_EMBEDDING_MODEL = DashScopeModel.EmbeddingModel.EMBEDDING_V2.getValue();
 
-	public static final String DEFAULT_EMBEDDING_TEXT_TYPE = DashScopeModel.EmbeddingTextType.DOCUMENT.getValue();
+    public static final String DEFAULT_EMBEDDING_TEXT_TYPE = DashScopeModel.EmbeddingTextType.DOCUMENT.getValue();
 
-	private final RestClient restClient;
+    private final RestClient restClient;
 
-	private final WebClient webClient;
+    private final WebClient webClient;
 
-	private final ResponseErrorHandler responseErrorHandler;
+    private final ResponseErrorHandler responseErrorHandler;
 
     @Override
     public DashScopeApi clone() {
@@ -138,9 +150,9 @@ public class DashScopeApi {
 		return new Builder(this);
 	}
 
-	public static Builder builder() {
-		return new Builder();
-	}
+    public static Builder builder() {
+        return new Builder();
+    }
 
 	/**
      * Create a new chat completion api.
@@ -207,9 +219,9 @@ public class DashScopeApi {
 	}
 	// @formatter:on
 
-	/*******************************************
-	 * Embedding
-	 ******************************************/
+    /*******************************************
+     * Embedding
+     ******************************************/
 
     public ResponseEntity<DashScopeApiSpec.EmbeddingList> embeddings(DashScopeApiSpec.EmbeddingRequest embeddingRequest) {
 
@@ -218,312 +230,334 @@ public class DashScopeApi {
         Assert.isTrue(!CollectionUtils.isEmpty(embeddingRequest.input().texts()), "The input texts can not be empty.");
         Assert.isTrue(embeddingRequest.input().texts().size() <= 25, "The input texts limit 25.");
 
+        // modified by liufy 动态换apiKey
+        MultiValueMap<String, String> additionalHttpHeader = new LinkedMultiValueMap<>();
+        Map<String, String> apiKeyHeaders = ApiKeySelector.INST.getApiKeyHeaders(embeddingRequest.model());
+        for (Map.Entry<String, String> entry : apiKeyHeaders.entrySet()) {
+            additionalHttpHeader.add(entry.getKey(), entry.getValue());
+        }
+
         return this.restClient.post()
                 .uri(this.embeddingsPath)
-                .headers(this::addDefaultHeadersIfMissing)
+                // modified by liufy 动态换apiKey
+                .headers(headers -> {
+                    headers.addAll(additionalHttpHeader);
+                    addDefaultHeadersIfMissing(headers);
+                })
                 .body(embeddingRequest)
                 .retrieve()
                 .toEntity(DashScopeApiSpec.EmbeddingList.class);
     }
 
-	public String upload(File file, DashScopeApiSpec.UploadRequest request) {
-		// apply to upload
-		ResponseEntity<DashScopeApiSpec.UploadLeaseResponse> responseEntity = uploadLease(request);
-		var uploadLeaseResponse = responseEntity.getBody();
-		if (uploadLeaseResponse == null) {
-			throw new DashScopeException(ErrorCodeEnum.READER_APPLY_LEASE_ERROR);
-		}
-		if (!"SUCCESS".equalsIgnoreCase(uploadLeaseResponse.code())) {
-			throw new DashScopeException("ApplyLease Failed,code:%s,message:%s".formatted(uploadLeaseResponse.code(),
-					uploadLeaseResponse.message()));
-		}
-		uploadFile(file, uploadLeaseResponse);
-		return addFile(uploadLeaseResponse.data().leaseId(), request);
-	}
+    public String upload(File file, DashScopeApiSpec.UploadRequest request) {
+        // apply to upload
+        ResponseEntity<DashScopeApiSpec.UploadLeaseResponse> responseEntity = uploadLease(request);
+        var uploadLeaseResponse = responseEntity.getBody();
+        if (uploadLeaseResponse == null) {
+            throw new DashScopeException(ErrorCodeEnum.READER_APPLY_LEASE_ERROR);
+        }
+        if (!"SUCCESS".equalsIgnoreCase(uploadLeaseResponse.code())) {
+            throw new DashScopeException("ApplyLease Failed,code:%s,message:%s".formatted(uploadLeaseResponse.code(),
+                    uploadLeaseResponse.message()));
+        }
+        uploadFile(file, uploadLeaseResponse);
+        return addFile(uploadLeaseResponse.data().leaseId(), request);
+    }
 
-	public ResponseEntity<DashScopeApiSpec.CommonResponse<DashScopeApiSpec.QueryFileResponseData>> queryFileInfo(String categoryId,
-																												 DashScopeApiSpec.UploadRequest.QueryFileRequest request) {
-		return this.restClient.post()
-			.uri(QUERY_CATEGORY_RESTFUL_URL, categoryId, request.fileId())
-			.body(request)
-			.retrieve()
-			.toEntity(new ParameterizedTypeReference<>() {
-			});
-	}
+    public ResponseEntity<DashScopeApiSpec.CommonResponse<DashScopeApiSpec.QueryFileResponseData>> queryFileInfo(String categoryId,
+                                                                                                                 DashScopeApiSpec.UploadRequest.QueryFileRequest request) {
+        return this.restClient.post()
+                .uri(QUERY_CATEGORY_RESTFUL_URL, categoryId, request.fileId())
+                .body(request)
+                .retrieve()
+                .toEntity(new ParameterizedTypeReference<>() {
+                });
+    }
 
-	public String getFileParseResult(String categoryId, DashScopeApiSpec.UploadRequest.QueryFileRequest request) {
-		ResponseEntity<DashScopeApiSpec.CommonResponse<DashScopeApiSpec.QueryFileParseResultData>> fileParseResponse = this.restClient.post()
-			.uri(DOWNLOAD_LEASE_CATEGORY_RESTFUL_URL, categoryId, request.fileId())
-			.body(request)
-			.retrieve()
-			.toEntity(new ParameterizedTypeReference<>() {
-			});
-		if (fileParseResponse == null || fileParseResponse.getBody() == null) {
-			throw new DashScopeException("GetDocumentParseResultError");
-		}
-		DashScopeApiSpec.CommonResponse<DashScopeApiSpec.QueryFileParseResultData> commonResponse = fileParseResponse.getBody();
+    public String getFileParseResult(String categoryId, DashScopeApiSpec.UploadRequest.QueryFileRequest request) {
+        ResponseEntity<DashScopeApiSpec.CommonResponse<DashScopeApiSpec.QueryFileParseResultData>> fileParseResponse = this.restClient.post()
+                .uri(DOWNLOAD_LEASE_CATEGORY_RESTFUL_URL, categoryId, request.fileId())
+                .body(request)
+                .retrieve()
+                .toEntity(new ParameterizedTypeReference<>() {
+                });
+        if (fileParseResponse == null || fileParseResponse.getBody() == null) {
+            throw new DashScopeException("GetDocumentParseResultError");
+        }
+        DashScopeApiSpec.CommonResponse<DashScopeApiSpec.QueryFileParseResultData> commonResponse = fileParseResponse.getBody();
 
-		RestTemplate restTemplate = new RestTemplate();
-		HttpHeaders headers = new HttpHeaders();
-		for (String key : commonResponse.data().param().headers().keySet()) {
-			headers.set(key, commonResponse.data().param().headers().get(key));
-		}
-		try {
-			HttpEntity<InputStreamResource> requestEntity = new HttpEntity<>(null, headers);
-			ResponseEntity<String> response = restTemplate.exchange(new URI(commonResponse.data().param().url()),
-					HttpMethod.GET, requestEntity, String.class);
-			return response.getBody();
-		}
-		catch (Exception ex) {
-			throw new DashScopeException("GetDocumentParseResultError");
-		}
-	}
+        RestTemplate restTemplate = new RestTemplate();
+        HttpHeaders headers = new HttpHeaders();
+        for (String key : commonResponse.data().param().headers().keySet()) {
+            headers.set(key, commonResponse.data().param().headers().get(key));
+        }
+        try {
+            HttpEntity<InputStreamResource> requestEntity = new HttpEntity<>(null, headers);
+            ResponseEntity<String> response = restTemplate.exchange(new URI(commonResponse.data().param().url()),
+                    HttpMethod.GET, requestEntity, String.class);
+            return response.getBody();
+        } catch (Exception ex) {
+            throw new DashScopeException("GetDocumentParseResultError");
+        }
+    }
 
-	private String addFile(String leaseId, DashScopeApiSpec.UploadRequest request) {
-		try {
-			DashScopeApiSpec.UploadRequest.AddFileRequest addFileRequest = new DashScopeApiSpec.UploadRequest.AddFileRequest(leaseId,
-					DEFAULT_PARSER_NAME);
-			ResponseEntity<DashScopeApiSpec.CommonResponse<DashScopeApiSpec.AddFileResponseData>> response = this.restClient.post()
-				.uri(ADD_FILE_CATEGORY_RESTFUL_URL, request.categoryId())
-				.body(addFileRequest)
-				.retrieve()
-				.toEntity(new ParameterizedTypeReference<>() {
-				});
-			DashScopeApiSpec.CommonResponse<DashScopeApiSpec.AddFileResponseData> addFileResponse = response.getBody();
-			if (addFileResponse == null || !"SUCCESS".equals(addFileResponse.code().toUpperCase())) {
-				throw new DashScopeException(ErrorCodeEnum.READER_ADD_FILE_ERROR);
-			}
-			DashScopeApiSpec.AddFileResponseData addFileResult = addFileResponse.data();
-			return addFileResult.fileId();
-		}
-		catch (Exception ex) {
-			throw new DashScopeException(ErrorCodeEnum.READER_ADD_FILE_ERROR);
-		}
-	}
+    private String addFile(String leaseId, DashScopeApiSpec.UploadRequest request) {
+        try {
+            DashScopeApiSpec.UploadRequest.AddFileRequest addFileRequest = new DashScopeApiSpec.UploadRequest.AddFileRequest(leaseId,
+                    DEFAULT_PARSER_NAME);
+            ResponseEntity<DashScopeApiSpec.CommonResponse<DashScopeApiSpec.AddFileResponseData>> response = this.restClient.post()
+                    .uri(ADD_FILE_CATEGORY_RESTFUL_URL, request.categoryId())
+                    .body(addFileRequest)
+                    .retrieve()
+                    .toEntity(new ParameterizedTypeReference<>() {
+                    });
+            DashScopeApiSpec.CommonResponse<DashScopeApiSpec.AddFileResponseData> addFileResponse = response.getBody();
+            if (addFileResponse == null || !"SUCCESS".equals(addFileResponse.code().toUpperCase())) {
+                throw new DashScopeException(ErrorCodeEnum.READER_ADD_FILE_ERROR);
+            }
+            DashScopeApiSpec.AddFileResponseData addFileResult = addFileResponse.data();
+            return addFileResult.fileId();
+        } catch (Exception ex) {
+            throw new DashScopeException(ErrorCodeEnum.READER_ADD_FILE_ERROR);
+        }
+    }
 
-	private void uploadFile(File file, DashScopeApiSpec.UploadLeaseResponse uploadLeaseResponse) {
-		try {
-			DashScopeApiSpec.UploadLeaseParamData uploadParam = uploadLeaseResponse.data().param();
-			OkHttpClient client = new OkHttpClient.Builder().connectTimeout(60, TimeUnit.SECONDS)
-				.writeTimeout(60, TimeUnit.SECONDS)
-				.readTimeout(60, TimeUnit.SECONDS)
-				.build();
+    private void uploadFile(File file, DashScopeApiSpec.UploadLeaseResponse uploadLeaseResponse) {
+        try {
+            DashScopeApiSpec.UploadLeaseParamData uploadParam = uploadLeaseResponse.data().param();
+            OkHttpClient client = new OkHttpClient.Builder().connectTimeout(60, TimeUnit.SECONDS)
+                    .writeTimeout(60, TimeUnit.SECONDS)
+                    .readTimeout(60, TimeUnit.SECONDS)
+                    .build();
 
-			okhttp3.Headers.Builder headersBuilder = new okhttp3.Headers.Builder();
-			String contentType = uploadParam.header().remove("Content-Type");
+            okhttp3.Headers.Builder headersBuilder = new okhttp3.Headers.Builder();
+            String contentType = uploadParam.header().remove("Content-Type");
 
-			for (String key : uploadParam.header().keySet()) {
-				headersBuilder.add(key, uploadParam.header().get(key));
-			}
+            for (String key : uploadParam.header().keySet()) {
+                headersBuilder.add(key, uploadParam.header().get(key));
+            }
 
-			RequestBody requestBody;
-			if (StringUtils.hasLength(contentType)) {
-				requestBody = RequestBody.create(file, okhttp3.MediaType.parse(contentType));
-			}
-			else {
-				requestBody = RequestBody.create(file, null);
-				headersBuilder.add("Content-Type", "");
-			}
+            RequestBody requestBody;
+            if (StringUtils.hasLength(contentType)) {
+                requestBody = RequestBody.create(file, okhttp3.MediaType.parse(contentType));
+            } else {
+                requestBody = RequestBody.create(file, null);
+                headersBuilder.add("Content-Type", "");
+            }
 
-			Request request = new Request.Builder().url(uploadParam.url())
-				.headers(headersBuilder.build())
-				.put(requestBody)
-				.build();
+            Request request = new Request.Builder().url(uploadParam.url())
+                    .headers(headersBuilder.build())
+                    .put(requestBody)
+                    .build();
 
-			try (Response response = client.newCall(request).execute()) {
-				if (!response.isSuccessful()) {
-					throw new Exception("Unexpected response code: " + response.code());
-				}
-			}
-		}
-		catch (Exception ex) {
-			throw new DashScopeException("Upload File Failed", ex);
-		}
-	}
+            try (Response response = client.newCall(request).execute()) {
+                if (!response.isSuccessful()) {
+                    throw new Exception("Unexpected response code: " + response.code());
+                }
+            }
+        } catch (Exception ex) {
+            throw new DashScopeException("Upload File Failed", ex);
+        }
+    }
 
-	private ResponseEntity<DashScopeApiSpec.UploadLeaseResponse> uploadLease(DashScopeApiSpec.UploadRequest request) {
-		return this.restClient.post()
-			.uri(UPLOAD_LEASE_CATEGORY_RESTFUL_URL, request.categoryId())
-			.body(request)
-			.retrieve()
-			.toEntity(DashScopeApiSpec.UploadLeaseResponse.class);
-	}
+    private ResponseEntity<DashScopeApiSpec.UploadLeaseResponse> uploadLease(DashScopeApiSpec.UploadRequest request) {
+        return this.restClient.post()
+                .uri(UPLOAD_LEASE_CATEGORY_RESTFUL_URL, request.categoryId())
+                .body(request)
+                .retrieve()
+                .toEntity(DashScopeApiSpec.UploadLeaseResponse.class);
+    }
 
-	public ResponseEntity<DashScopeApiSpec.DocumentSplitResponse> documentSplit(Document document,
-																				DashScopeDocumentTransformerOptions options) {
-		DashScopeApiSpec.DocumentSplitRequest request = new DashScopeApiSpec.DocumentSplitRequest(document.getText(), options.getChunkSize(),
-				options.getOverlapSize(), options.getFileType(), options.getLanguage(), options.getSeparator());
-		return this.restClient.post()
-			.uri(DOCUMENT_SPLITER_RESTFUL_URL)
-			.body(request)
-			.retrieve()
-			.toEntity(new ParameterizedTypeReference<>() {
-			});
-	}
+    public ResponseEntity<DashScopeApiSpec.DocumentSplitResponse> documentSplit(Document document,
+                                                                                DashScopeDocumentTransformerOptions options) {
+        DashScopeApiSpec.DocumentSplitRequest request = new DashScopeApiSpec.DocumentSplitRequest(document.getText(), options.getChunkSize(),
+                options.getOverlapSize(), options.getFileType(), options.getLanguage(), options.getSeparator());
+        return this.restClient.post()
+                .uri(DOCUMENT_SPLITER_RESTFUL_URL)
+                .body(request)
+                .retrieve()
+                .toEntity(new ParameterizedTypeReference<>() {
+                });
+    }
 
-	public String getPipelineIdByName(String pipelineName) {
-		ResponseEntity<DashScopeApiSpec.QueryPipelineResponse> startPipelineResponse = this.restClient.get()
-			.uri(ub -> ub.path(PIPELINE_SIMPLE_RESTFUL_URL).queryParam("pipeline_name", pipelineName).build())
-			.retrieve()
-			.toEntity(DashScopeApiSpec.QueryPipelineResponse.class);
-		if (startPipelineResponse == null || startPipelineResponse.getBody() == null
-				|| startPipelineResponse.getBody().pipelineId() == null) {
-			return null;
-		}
-		return startPipelineResponse.getBody().pipelineId();
-	}
+    private static final Map<String, String> PIPELINE_ID_MAP = new ConcurrentHashMap<>();
 
-	public void upsertPipeline(List<Document> documents, DashScopeStoreOptions storeOptions) {
-		String embeddingModelName = (storeOptions.getEmbeddingOptions() == null ? DEFAULT_EMBEDDING_MODEL
-				: storeOptions.getEmbeddingOptions().getModel());
-		DashScopeApiSpec.EmbeddingConfiguredTransformations embeddingConfig = new DashScopeApiSpec.EmbeddingConfiguredTransformations(
-				"DASHSCOPE_EMBEDDING",
-				new DashScopeApiSpec.EmbeddingConfiguredTransformations.EmbeddingComponent(embeddingModelName));
-		DashScopeDocumentTransformerOptions transformerOptions = storeOptions.getTransformerOptions();
-		if (transformerOptions == null) {
-			transformerOptions = new DashScopeDocumentTransformerOptions();
-		}
-		DashScopeApiSpec.ParserConfiguredTransformations parserConfig = new DashScopeApiSpec.ParserConfiguredTransformations(
-				"DASHSCOPE_JSON_NODE_PARSER",
-				new DashScopeApiSpec.ParserConfiguredTransformations.ParserComponent(
-						transformerOptions.getChunkSize(), transformerOptions.getOverlapSize(), "idp",
-						transformerOptions.getSeparator(), transformerOptions.getLanguage()));
-		DashScopeDocumentRetrieverOptions retrieverOptions = storeOptions.getRetrieverOptions();
-		if (retrieverOptions == null) {
-			retrieverOptions = new DashScopeDocumentRetrieverOptions();
-		}
-		DashScopeApiSpec.RetrieverConfiguredTransformations retrieverConfig = new DashScopeApiSpec.RetrieverConfiguredTransformations(
-				"DASHSCOPE_RETRIEVER",
-				new DashScopeApiSpec.RetrieverConfiguredTransformations.RetrieverComponent(
-						retrieverOptions.isEnableRewrite(),
+    public String getPipelineIdByName(String pipelineName) {
+        // modified by liufy 缓存ID
+        if (PIPELINE_ID_MAP.get(pipelineName) != null) {
+            return PIPELINE_ID_MAP.get(pipelineName);
+        }
+
+        ResponseEntity<DashScopeApiSpec.QueryPipelineResponse> startPipelineResponse = this.restClient.get()
+                .uri(ub -> ub.path(PIPELINE_SIMPLE_RESTFUL_URL).queryParam("pipeline_name", pipelineName).build())
+                .retrieve()
+                .toEntity(DashScopeApiSpec.QueryPipelineResponse.class);
+        if (startPipelineResponse == null || startPipelineResponse.getBody() == null
+                || startPipelineResponse.getBody().pipelineId() == null) {
+            return null;
+        }
+        return startPipelineResponse.getBody().pipelineId();
+    }
+
+    public void upsertPipeline(List<Document> documents, DashScopeStoreOptions storeOptions) {
+        String embeddingModelName = (storeOptions.getEmbeddingOptions() == null ? DEFAULT_EMBEDDING_MODEL
+                : storeOptions.getEmbeddingOptions().getModel());
+        DashScopeApiSpec.EmbeddingConfiguredTransformations embeddingConfig = new DashScopeApiSpec.EmbeddingConfiguredTransformations(
+                "DASHSCOPE_EMBEDDING",
+                new DashScopeApiSpec.EmbeddingConfiguredTransformations.EmbeddingComponent(embeddingModelName));
+        DashScopeDocumentTransformerOptions transformerOptions = storeOptions.getTransformerOptions();
+        if (transformerOptions == null) {
+            transformerOptions = new DashScopeDocumentTransformerOptions();
+        }
+        DashScopeApiSpec.ParserConfiguredTransformations parserConfig = new DashScopeApiSpec.ParserConfiguredTransformations(
+                "DASHSCOPE_JSON_NODE_PARSER",
+                new DashScopeApiSpec.ParserConfiguredTransformations.ParserComponent(
+                        transformerOptions.getChunkSize(), transformerOptions.getOverlapSize(), "idp",
+                        transformerOptions.getSeparator(), transformerOptions.getLanguage()));
+        DashScopeDocumentRetrieverOptions retrieverOptions = storeOptions.getRetrieverOptions();
+        if (retrieverOptions == null) {
+            retrieverOptions = new DashScopeDocumentRetrieverOptions();
+        }
+        DashScopeApiSpec.RetrieverConfiguredTransformations retrieverConfig = new DashScopeApiSpec.RetrieverConfiguredTransformations(
+                "DASHSCOPE_RETRIEVER",
+                new DashScopeApiSpec.RetrieverConfiguredTransformations.RetrieverComponent(
+                        retrieverOptions.isEnableRewrite(),
                         List.of(new DashScopeApiSpec.RetrieverConfiguredTransformations.CommonModelComponent(
                                 retrieverOptions.getRewriteModelName())),
-						retrieverOptions.getSparseSimilarityTopK(), retrieverOptions.getDenseSimilarityTopK(),
-						retrieverOptions.isEnableReranking(),
+                        retrieverOptions.getSparseSimilarityTopK(), retrieverOptions.getDenseSimilarityTopK(),
+                        retrieverOptions.isEnableReranking(),
                         List.of(new DashScopeApiSpec.RetrieverConfiguredTransformations.CommonModelComponent(
                                 retrieverOptions.getRerankModelName())),
-						retrieverOptions.getRerankMinScore(), retrieverOptions.getRerankTopN(),
-						retrieverOptions.getSearchFilters()));
-		List<String> documentIdList = documents.stream()
-			.map(Document::getId)
-			.filter(Objects::nonNull)
-			.collect(Collectors.toList());
-		DashScopeApiSpec.UpsertPipelineRequest upsertPipelineRequest = new DashScopeApiSpec.UpsertPipelineRequest(storeOptions.getIndexName(),
-				"MANAGED_SHARED", null, "unstructured", "recommend",
-				Arrays.asList(embeddingConfig, parserConfig, retrieverConfig),
+                        retrieverOptions.getRerankMinScore(), retrieverOptions.getRerankTopN(),
+                        retrieverOptions.getSearchFilters()));
+        List<String> documentIdList = documents.stream()
+                .map(Document::getId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+        DashScopeApiSpec.UpsertPipelineRequest upsertPipelineRequest = new DashScopeApiSpec.UpsertPipelineRequest(storeOptions.getIndexName(),
+                "MANAGED_SHARED", null, "unstructured", "recommend",
+                Arrays.asList(embeddingConfig, parserConfig, retrieverConfig),
                 List.of(new DashScopeApiSpec.DataSourcesConfig("DATA_CENTER_FILE",
                         new DashScopeApiSpec.DataSourcesConfig.DataSourcesComponent(documentIdList))),
                 List.of(new DashScopeApiSpec.DataSinksConfig("BUILT_IN", null))
 
-		);
-		ResponseEntity<DashScopeApiSpec.UpsertPipelineResponse> upsertPipelineResponse = this.restClient.put()
-			.uri(PIPELINE_RESTFUL_URL)
-			.body(upsertPipelineRequest)
-			.retrieve()
-			.toEntity(DashScopeApiSpec.UpsertPipelineResponse.class);
-		if (upsertPipelineResponse.getBody() == null
-				|| !"SUCCESS".equalsIgnoreCase(upsertPipelineResponse.getBody().status())) {
-			throw new DashScopeException(ErrorCodeEnum.CREATE_INDEX_ERROR);
-		}
-		String pipelineId = upsertPipelineResponse.getBody().id();
-		ResponseEntity<DashScopeApiSpec.StartPipelineResponse> startPipelineResponse = this.restClient.post()
-			.uri(MANAGED_INGEST_PIPELINE_RESTFUL_URL, pipelineId)
-			.body(upsertPipelineRequest)
-			.retrieve()
-			.toEntity(DashScopeApiSpec.StartPipelineResponse.class);
-		if (startPipelineResponse.getBody() == null || !"SUCCESS".equalsIgnoreCase(startPipelineResponse.getBody().code())
-				|| startPipelineResponse.getBody().ingestionId() == null) {
-			throw new DashScopeException(ErrorCodeEnum.INDEX_ADD_DOCUMENT_ERROR);
-		}
-	}
+        );
+        ResponseEntity<DashScopeApiSpec.UpsertPipelineResponse> upsertPipelineResponse = this.restClient.put()
+                .uri(PIPELINE_RESTFUL_URL)
+                .body(upsertPipelineRequest)
+                .retrieve()
+                .toEntity(DashScopeApiSpec.UpsertPipelineResponse.class);
+        if (upsertPipelineResponse.getBody() == null
+                || !"SUCCESS".equalsIgnoreCase(upsertPipelineResponse.getBody().status())) {
+            throw new DashScopeException(ErrorCodeEnum.CREATE_INDEX_ERROR);
+        }
+        String pipelineId = upsertPipelineResponse.getBody().id();
+        ResponseEntity<DashScopeApiSpec.StartPipelineResponse> startPipelineResponse = this.restClient.post()
+                .uri(MANAGED_INGEST_PIPELINE_RESTFUL_URL, pipelineId)
+                .body(upsertPipelineRequest)
+                .retrieve()
+                .toEntity(DashScopeApiSpec.StartPipelineResponse.class);
+        if (startPipelineResponse.getBody() == null || !"SUCCESS".equalsIgnoreCase(startPipelineResponse.getBody().code())
+                || startPipelineResponse.getBody().ingestionId() == null) {
+            throw new DashScopeException(ErrorCodeEnum.INDEX_ADD_DOCUMENT_ERROR);
+        }
+    }
 
-	public boolean deletePipelineDocument(String pipelineId, List<String> idList) {
-		DashScopeApiSpec.DelePipelineDocumentRequest request = new DashScopeApiSpec.DelePipelineDocumentRequest(Arrays
-			.asList(new DashScopeApiSpec.DelePipelineDocumentRequest.DelePipelineDocumentDataSource("DATA_CENTER_FILE",
-					Arrays.asList(new DashScopeApiSpec.DelePipelineDocumentRequest.DelePipelineDocumentDataSourceComponent(idList)))));
-		ResponseEntity<DashScopeApiSpec.DelePipelineDocumentResponse> deleDocumentResponse = this.restClient.post()
-			.uri(DELETE_PIPELINE_RESTFUL_URL, pipelineId)
-			.body(request)
-			.retrieve()
-			.toEntity(DashScopeApiSpec.DelePipelineDocumentResponse.class);
-		if (deleDocumentResponse == null || deleDocumentResponse.getBody() == null
-				|| !"SUCCESS".equalsIgnoreCase(deleDocumentResponse.getBody().code())) {
-			return false;
-		}
-		return true;
-	}
+    public boolean deletePipelineDocument(String pipelineId, List<String> idList) {
+        DashScopeApiSpec.DelePipelineDocumentRequest request = new DashScopeApiSpec.DelePipelineDocumentRequest(Arrays
+                .asList(new DashScopeApiSpec.DelePipelineDocumentRequest.DelePipelineDocumentDataSource("DATA_CENTER_FILE",
+                        Arrays.asList(new DashScopeApiSpec.DelePipelineDocumentRequest.DelePipelineDocumentDataSourceComponent(idList)))));
+        ResponseEntity<DashScopeApiSpec.DelePipelineDocumentResponse> deleDocumentResponse = this.restClient.post()
+                .uri(DELETE_PIPELINE_RESTFUL_URL, pipelineId)
+                .body(request)
+                .retrieve()
+                .toEntity(DashScopeApiSpec.DelePipelineDocumentResponse.class);
+        if (deleDocumentResponse == null || deleDocumentResponse.getBody() == null
+                || !"SUCCESS".equalsIgnoreCase(deleDocumentResponse.getBody().code())) {
+            return false;
+        }
+        return true;
+    }
 
-	public List<Document> retriever(String pipelineId, String query, DashScopeDocumentRetrieverOptions searchOption) {
-		DashScopeApiSpec.DocumentRetrieveRequest request = new DashScopeApiSpec.DocumentRetrieveRequest(query, searchOption.getDenseSimilarityTopK(),
-				searchOption.getDenseSimilarityTopK(), searchOption.isEnableRewrite(),
+    public List<Document> retriever(String pipelineId, String query, DashScopeDocumentRetrieverOptions searchOption) {
+        DashScopeApiSpec.DocumentRetrieveRequest request = new DashScopeApiSpec.DocumentRetrieveRequest(query, searchOption.getDenseSimilarityTopK(),
+                searchOption.getDenseSimilarityTopK(), searchOption.isEnableRewrite(),
                 List.of(new DashScopeApiSpec.DocumentRetrieveRequest.DocumentRetrieveModelConfig(
                         searchOption.getRewriteModelName(), "DashScopeTextRewrite")),
-				searchOption.isEnableReranking(),
+                searchOption.isEnableReranking(),
                 List.of(new DashScopeApiSpec.DocumentRetrieveRequest.DocumentRetrieveModelConfig(searchOption.getRerankModelName(),
                         null)),
-				searchOption.getRerankMinScore(), searchOption.getRerankTopN(), searchOption.getSearchFilters());
-		ResponseEntity<DashScopeApiSpec.DocumentRetrieveResponse> deleDocumentResponse = this.restClient.post()
-			.uri(RETRIEVE_PIPELINE_RESTFUL_URL, pipelineId)
-			.body(request)
-			.retrieve()
-			.toEntity(DashScopeApiSpec.DocumentRetrieveResponse.class);
-		if (deleDocumentResponse == null || deleDocumentResponse.getBody() == null
-				|| !"SUCCESS".equalsIgnoreCase(deleDocumentResponse.getBody().code())) {
-			throw new DashScopeException(ErrorCodeEnum.RETRIEVER_DOCUMENT_ERROR);
-		}
-		List<DashScopeApiSpec.DocumentRetrieveResponse.DocumentRetrieveResponseNode> nodeList = deleDocumentResponse.getBody().nodes();
-		if (nodeList == null || nodeList.isEmpty()) {
-			return new ArrayList<>();
-		}
-		List<Document> documents = new ArrayList<>();
-		nodeList.forEach(e -> {
-			DashScopeApiSpec.DocumentRetrieveResponse.DocumentRetrieveResponseNodeData nodeData = e.node();
-			Document toDocument = new Document(nodeData.id(), nodeData.text(), nodeData.metadata());
-			documents.add(toDocument);
-		});
-		return documents;
-	}
+                searchOption.getRerankMinScore(), searchOption.getRerankTopN(), searchOption.getSearchFilters());
+        ResponseEntity<DashScopeApiSpec.DocumentRetrieveResponse> deleDocumentResponse = this.restClient.post()
+                .uri(RETRIEVE_PIPELINE_RESTFUL_URL, pipelineId)
+                .body(request)
+                .retrieve()
+                .toEntity(DashScopeApiSpec.DocumentRetrieveResponse.class);
+        if (deleDocumentResponse == null || deleDocumentResponse.getBody() == null
+                || !"SUCCESS".equalsIgnoreCase(deleDocumentResponse.getBody().code())) {
+            throw new DashScopeException(ErrorCodeEnum.RETRIEVER_DOCUMENT_ERROR);
+        }
+        List<DashScopeApiSpec.DocumentRetrieveResponse.DocumentRetrieveResponseNode> nodeList = deleDocumentResponse.getBody().nodes();
+        if (nodeList == null || nodeList.isEmpty()) {
+            return new ArrayList<>();
+        }
+        List<Document> documents = new ArrayList<>();
+        nodeList.forEach(e -> {
+            DashScopeApiSpec.DocumentRetrieveResponse.DocumentRetrieveResponseNodeData nodeData = e.node();
+            Document toDocument = new Document(nodeData.id(), nodeData.text(), nodeData.metadata());
+            documents.add(toDocument);
+        });
+        return documents;
+    }
 
 
-	public static String getTextContent(List<DashScopeApiSpec.ChatCompletionMessage.MediaContent> content) {
-		return content.stream()
-			.filter(c -> "text".equals(c.type()))
-			.map(DashScopeApiSpec.ChatCompletionMessage.MediaContent::text)
-			.reduce("", (a, b) -> a + b);
-	}
+    public static String getTextContent(List<DashScopeApiSpec.ChatCompletionMessage.MediaContent> content) {
+        return content.stream()
+                .filter(c -> "text".equals(c.type()))
+                .map(DashScopeApiSpec.ChatCompletionMessage.MediaContent::text)
+                .reduce("", (a, b) -> a + b);
+    }
 
-	/**
-	 * Creates a model response for the given chat conversation.
-	 * @param chatRequest The chat completion request.
-	 * @return Entity response with {@link DashScopeApiSpec.ChatCompletion} as a body and HTTP status code
-	 * and headers.
-	 */
-	public ResponseEntity<DashScopeApiSpec.ChatCompletion> chatCompletionEntity(DashScopeApiSpec.ChatCompletionRequest chatRequest) {
+    /**
+     * Creates a model response for the given chat conversation.
+     *
+     * @param chatRequest The chat completion request.
+     * @return Entity response with {@link DashScopeApiSpec.ChatCompletion} as a body and HTTP status code
+     * and headers.
+     */
+    public ResponseEntity<DashScopeApiSpec.ChatCompletion> chatCompletionEntity(DashScopeApiSpec.ChatCompletionRequest chatRequest) {
 
         return chatCompletionEntity(chatRequest, new LinkedMultiValueMap<>());
-	}
+    }
 
-	/**
-	 * Creates a model response for the given chat conversation.
-	 * @param chatRequest The chat completion request.
-	 * @param additionalHttpHeader Optional, additional HTTP headers to be added to the
-	 * request.
-	 * @return Entity response with {@link DashScopeApiSpec.ChatCompletion} as a body and HTTP status code
-	 * and headers.
-	 */
-	public ResponseEntity<DashScopeApiSpec.ChatCompletion> chatCompletionEntity(DashScopeApiSpec.ChatCompletionRequest chatRequest,
-																				MultiValueMap<String, String> additionalHttpHeader) {
+    /**
+     * Creates a model response for the given chat conversation.
+     *
+     * @param chatRequest          The chat completion request.
+     * @param additionalHttpHeader Optional, additional HTTP headers to be added to the
+     *                             request.
+     * @return Entity response with {@link DashScopeApiSpec.ChatCompletion} as a body and HTTP status code
+     * and headers.
+     */
+    public ResponseEntity<DashScopeApiSpec.ChatCompletion> chatCompletionEntity(DashScopeApiSpec.ChatCompletionRequest chatRequest,
+                                                                                MultiValueMap<String, String> additionalHttpHeader) {
 
-		Assert.notNull(chatRequest, "The request body can not be null.");
-		Assert.isTrue(!chatRequest.stream(), "Request must set the stream property to false.");
-		Assert.notNull(additionalHttpHeader, "The additional HTTP headers can not be null.");
+        Assert.notNull(chatRequest, "The request body can not be null.");
+        Assert.isTrue(!chatRequest.stream(), "Request must set the stream property to false.");
+        Assert.notNull(additionalHttpHeader, "The additional HTTP headers can not be null.");
 
-		var chatCompletionUri = this.completionsPath;
-		if (chatRequest.multiModel()) {
-			chatCompletionUri = MULTIMODAL_GENERATION_RESTFUL_URL;
-		}
+        var chatCompletionUri = this.completionsPath;
+        if (chatRequest.multiModel()) {
+            chatCompletionUri = MULTIMODAL_GENERATION_RESTFUL_URL;
+        }
 
-		// @formatter:off
+        // modified by liufy 动态换apiKey
+        Map<String, String> apiKeyHeaders = ApiKeySelector.INST.getApiKeyHeaders(chatRequest.model());
+        for (Map.Entry<String, String> entry : apiKeyHeaders.entrySet()) {
+            additionalHttpHeader.add(entry.getKey(), entry.getValue());
+        }
+
+        // @formatter:off
 		return this.restClient.post()
 				.uri(chatCompletionUri)
 				.headers(headers -> {
@@ -534,105 +568,245 @@ public class DashScopeApi {
 				.retrieve()
 				.toEntity(DashScopeApiSpec.ChatCompletion.class);
 		// @formatter:on
-	}
+    }
 
-	private void addDefaultHeadersIfMissing(HttpHeaders headers) {
+    private void addDefaultHeadersIfMissing(HttpHeaders headers) {
 
-		if (!headers.containsKey(HttpHeaders.AUTHORIZATION) && !(this.apiKey instanceof NoopApiKey)) {
-			headers.setBearerAuth(this.apiKey.getValue());
-		}
-	}
+        if (!headers.containsKey(HttpHeaders.AUTHORIZATION) && !(this.apiKey instanceof NoopApiKey)) {
+            headers.setBearerAuth(this.apiKey.getValue());
+        }
+    }
 
-	/**
-	 * Creates a streaming chat response for the given chat conversation.
-	 * @param chatRequest The chat completion request. Must have the stream property set
-	 * to true.
-	 * @return Returns a {@link Flux} stream from chat completion chunks.
-	 */
-	public Flux<DashScopeApiSpec.ChatCompletionChunk> chatCompletionStream(DashScopeApiSpec.ChatCompletionRequest chatRequest) {
+    /**
+     * Creates a streaming chat response for the given chat conversation.
+     *
+     * @param chatRequest The chat completion request. Must have the stream property set
+     *                    to true.
+     * @return Returns a {@link Flux} stream from chat completion chunks.
+     */
+    public Flux<DashScopeApiSpec.ChatCompletionChunk> chatCompletionStream(DashScopeApiSpec.ChatCompletionRequest chatRequest) {
 
-		return this.chatCompletionStream(chatRequest, null);
-	}
+        return this.chatCompletionStream(chatRequest, null);
+    }
 
-	/**
-	 * Creates a streaming chat response for the given chat conversation.
-	 * @param chatRequest The chat completion request. Must have the stream property set
-	 * to true.
-	 * @param additionalHttpHeader Optional, additional HTTP headers to be added to the
-	 * request.
-	 * @return Returns a {@link Flux} stream from chat completion chunks.
-	 */
-	public Flux<DashScopeApiSpec.ChatCompletionChunk> chatCompletionStream(DashScopeApiSpec.ChatCompletionRequest chatRequest,
-																		   MultiValueMap<String, String> additionalHttpHeader) {
+    /**
+     * Creates a streaming chat response for the given chat conversation.
+     *
+     * @param chatRequest          The chat completion request. Must have the stream property set
+     *                             to true.
+     * @param additionalHttpHeader Optional, additional HTTP headers to be added to the
+     *                             request.
+     * @return Returns a {@link Flux} stream from chat completion chunks.
+     */
+    public Flux<DashScopeApiSpec.ChatCompletionChunk> chatCompletionStream(DashScopeApiSpec.ChatCompletionRequest chatRequest,
+                                                                           MultiValueMap<String, String> additionalHttpHeader) {
 
-		Assert.notNull(chatRequest, "The request body can not be null.");
-		Assert.isTrue(chatRequest.stream(), "Request must set the stream property to true.");
+        Assert.notNull(chatRequest, "The request body can not be null.");
+        Assert.isTrue(chatRequest.stream(), "Request must set the stream property to true.");
 
-		AtomicBoolean isInsideTool = new AtomicBoolean(false);
-		boolean incrementalOutput = chatRequest.parameters() != null
-				&& chatRequest.parameters().incrementalOutput() != null && chatRequest.parameters().incrementalOutput();
-		DashScopeAiStreamFunctionCallingHelper chunkMerger = new DashScopeAiStreamFunctionCallingHelper(
-				incrementalOutput);
+        // modified by liufy 加随机request-id参数，为了和百炼mse网关排查问题
+        var chatCompletionUri = this.completionsPath + "?X-Request-Id=" + Utils.generateToken();
+        if (chatRequest.multiModel()) {
+            chatCompletionUri = MULTIMODAL_GENERATION_RESTFUL_URL;
+        }
 
-		var chatCompletionUri = this.completionsPath;
-		if (chatRequest.multiModel()) {
-			chatCompletionUri = MULTIMODAL_GENERATION_RESTFUL_URL;
-		}
+        // modified by liufy 添加header, 动态选择apiKey
+        Map<String, String> apiKeyHeaders = ApiKeySelector.INST.getApiKeyHeaders(chatRequest.model());
+        for (Map.Entry<String, String> entry : apiKeyHeaders.entrySet()) {
+            additionalHttpHeader.add(entry.getKey(), entry.getValue());
+        }
 
-		return this.webClient.post().uri(chatCompletionUri).headers(headers -> {
-			headers.addAll(additionalHttpHeader);
-			// For DashScope stream
-			headers.add(HEADER_SSE, ENABLED);
-			addDefaultHeadersIfMissing(headers);
-		})
-			.body(Mono.just(chatRequest), DashScopeApiSpec.ChatCompletionRequest.class)
-			.retrieve()
-			.bodyToFlux(String.class)
-			.takeUntil(SSE_DONE_PREDICATE)
-			.filter(SSE_DONE_PREDICATE.negate())
-			.map(content -> {
-				DashScopeApiSpec.DashScopeErrorResponse error = ModelOptionsUtils.jsonToObject(content, DashScopeApiSpec.DashScopeErrorResponse.class);
-				if (error != null && error.code() != null) {
-					throw new DashScopeException(String.format("[%s] %s (requestId: %s)",
-						error.code(), error.message(), error.requestId()));
-				}
-				DashScopeApiSpec.ChatCompletionChunk chunk = ModelOptionsUtils.jsonToObject(content, DashScopeApiSpec.ChatCompletionChunk.class);
-				if (chunk == null) {
-					throw new DashScopeException("Failed to parse response content: " + content);
-				}
-				return chunk;
-			})
-			.map(chunk -> {
-				if (chunkMerger.isStreamingToolFunctionCall(chunk)) {
-					isInsideTool.set(true);
-				}
-				return chunk;
-			})
-			.windowUntil(chunk -> {
-				if (isInsideTool.get() && chunkMerger.isStreamingToolFunctionCallFinish(chunk)) {
-					isInsideTool.set(false);
-					return true;
-				}
-				return !isInsideTool.get();
-			})
-			.concatMapIterable(window -> {
-				Mono<DashScopeApiSpec.ChatCompletionChunk> monoChunk = window.reduce(
-                        new DashScopeApiSpec.ChatCompletionChunk(null, null, null, null),
-						chunkMerger::merge
-                );
-				return List.of(monoChunk);
-			})
-			.flatMap(mono -> mono);
-	}
+        // 全链路日志
+        TransmittableEagleEyeTool transmittableEagleEyeTool = new TransmittableEagleEyeTool();
 
-	/**
-	 * Creates rerank request for dashscope rerank model.
-	 * @param rerankRequest The chat completion request.
-	 * @return Entity response with {@link DashScopeApiSpec.ChatCompletion} as a body and HTTP status code
-	 * and headers.
-	 */
-	public ResponseEntity<DashScopeApiSpec.RerankResponse> rerankEntity(DashScopeApiSpec.RerankRequest rerankRequest) {
-		Assert.notNull(rerankRequest, "The request body can not be null.");
+        // Use Flux.defer to ensure each retry attempt creates fresh state and a new HTTP request
+        String finalChatCompletionUri = chatCompletionUri;
+        return Flux.defer(() -> {
+            AtomicBoolean isInsideTool = new AtomicBoolean(false);
+            final AtomicReference<DashScopeApiSpec.ChatCompletionChunk> preChunk = new AtomicReference<>(new DashScopeApiSpec.ChatCompletionChunk(null, null, null, null));
+
+            boolean incrementalOutput = chatRequest.parameters() != null
+                    && chatRequest.parameters().incrementalOutput() != null && chatRequest.parameters().incrementalOutput();
+            DashScopeAiStreamFunctionCallingHelper chunkMerger = new DashScopeAiStreamFunctionCallingHelper(
+                    incrementalOutput);
+
+            return this.webClient.post().uri(finalChatCompletionUri).headers(headers -> {
+                        headers.addAll(additionalHttpHeader);
+                        // For DashScope stream
+                        headers.add(HEADER_SSE, ENABLED);
+                        addDefaultHeadersIfMissing(headers);
+                })
+                .body(Mono.just(chatRequest), DashScopeApiSpec.ChatCompletionRequest.class)
+                .retrieve()
+                .bodyToFlux(String.class)
+                .takeUntil(SSE_DONE_PREDICATE)
+                .filter(SSE_DONE_PREDICATE.negate())
+                .map(content -> {
+                    DashScopeApiSpec.DashScopeErrorResponse error = ModelOptionsUtils.jsonToObject(content, DashScopeApiSpec.DashScopeErrorResponse.class);
+                    if (error != null && error.code() != null) {
+                        throw new DashScopeException(String.format("[%s] %s (requestId: %s)",
+                                error.code(), error.message(), error.requestId()));
+                    }
+                    DashScopeApiSpec.ChatCompletionChunk chunk = ModelOptionsUtils.jsonToObject(content, DashScopeApiSpec.ChatCompletionChunk.class);
+                    if (chunk == null) {
+                        throw new DashScopeException("Failed to parse response content: " + content);
+                    }
+                    return chunk;
+                })
+                // modified by liufy 支持工具调用流式输出参数
+//			.map(chunk -> {
+//				if (chunkMerger.isStreamingToolFunctionCall(chunk)) {
+//					isInsideTool.set(true);
+//				}
+//				return chunk;
+//			})
+//			.windowUntil(chunk -> {
+//				if (isInsideTool.get() && chunkMerger.isStreamingToolFunctionCallFinish(chunk)) {
+//					isInsideTool.set(false);
+//					return true;
+//				}
+//				return !isInsideTool.get();
+//			})
+//			.concatMapIterable(window -> {
+//				Mono<DashScopeApiSpec.ChatCompletionChunk> monoChunk = window.reduce(
+//                        new DashScopeApiSpec.ChatCompletionChunk(null, null, null, null),
+//						chunkMerger::merge
+//                );
+//				return List.of(monoChunk);
+//			})
+//			.flatMap(mono -> mono);
+                .doOnNext(chunk -> {
+                    // 传递父线程的全链路业务日志的上下文
+                    transmittableEagleEyeTool.restoreContext();
+                })
+                .concatMap((chunk) -> {
+                    // 当前chunk
+                    log.info("received chunk：{}", chunk);
+
+                    // 开始工具调用
+                    if (chunkMerger.isStreamingToolFunctionCall(chunk)) {
+                        if (!isInsideTool.get()) {
+                            // 工具调用第一个chunk，初始化preChunk
+                            preChunk.set(new DashScopeApiSpec.ChatCompletionChunk(null, null, null, null));
+                        }
+                        isInsideTool.set(true);
+                    }
+
+                    if (isInsideTool.get()) {
+//                        chunk = createNewChunkFrom(chunk);
+                        // 在工具调用内部，合并 chunk
+                        preChunk.set(chunkMerger.merge(preChunk.get(), chunk));
+
+                        // 判断工具调用是否结束，如果结束了，则返回当前chunk和合并后的chunk，否则返回当前chunk
+                        if (chunkMerger.isStreamingToolFunctionCallFinish(chunk)) {
+                            isInsideTool.set(false);
+                            return Flux.just(chunk, preChunk.get());
+                        } else {
+                            return Mono.just(chunk);
+                        }
+                    } else {
+                        // 不在工具内部，直接返回 chunk
+                        return Mono.just(chunk);
+                    }
+                });
+        }).retryWhen(Retry.fixedDelay(30, Duration.ofSeconds(1)) // 最多重试30次，每次间隔1秒
+                .filter(throwable -> throwable instanceof WebClientResponseException.TooManyRequests || throwable instanceof WebClientResponseException.InternalServerError)
+                .doBeforeRetry(signal -> log.warn("Stream rate limited (429 Too Many Requests), retrying attempt: {}", signal.totalRetries() + 1)));
+    }
+
+    /**
+     * Creates a new chunk based on the input chunk, copying all fields and creating new instances
+     * for nested structures like output, choices, message, and toolCalls.
+     *
+     * @param originalChunk The original chunk to copy from
+     * @return A new chunk with copied content
+     */
+    private DashScopeApiSpec.ChatCompletionChunk createNewChunkFrom(DashScopeApiSpec.ChatCompletionChunk originalChunk) {
+        if (originalChunk == null) {
+            return null;
+        }
+
+        // Extract original values
+        String requestId = originalChunk.requestId();
+        DashScopeApiSpec.TokenUsage usage = originalChunk.usage();
+        Object o = originalChunk.o();
+
+        // Process output if it exists
+        DashScopeApiSpec.ChatCompletionOutput newOutput = null;
+        if (originalChunk.output() != null) {
+            String originalText = originalChunk.output().text();
+
+            // Process choices if they exist
+            List<DashScopeApiSpec.ChatCompletionOutput.Choice> newChoices = null;
+            if (originalChunk.output().choices() != null) {
+                newChoices = new ArrayList<>();
+
+                for (DashScopeApiSpec.ChatCompletionOutput.Choice originalChoice : originalChunk.output().choices()) {
+                    DashScopeApiSpec.ChatCompletionFinishReason finishReason = originalChoice.finishReason();
+
+                    // Process message if it exists
+                    DashScopeApiSpec.ChatCompletionMessage newMessage = null;
+                    if (originalChoice.message() != null) {
+                        Object rawContent = originalChoice.message().rawContent();
+                        DashScopeApiSpec.ChatCompletionMessage.Role role = originalChoice.message().role();
+                        String name = originalChoice.message().name();
+                        String toolCallId = originalChoice.message().toolCallId();
+
+                        // Process toolCalls if they exist
+                        List<DashScopeApiSpec.ChatCompletionMessage.ToolCall> newToolCalls = null;
+                        if (originalChoice.message().toolCalls() != null) {
+                            newToolCalls = new ArrayList<>();
+
+                            for (DashScopeApiSpec.ChatCompletionMessage.ToolCall originalToolCall : originalChoice.message().toolCalls()) {
+                                String id = originalToolCall.id();
+                                String type = originalToolCall.type();
+
+                                // Process function if it exists
+                                DashScopeApiSpec.ChatCompletionMessage.ChatCompletionFunction newFunction = null;
+                                if (originalToolCall.function() != null) {
+                                    String functionName = originalToolCall.function().name();
+                                    String functionArguments = originalToolCall.function().arguments();
+                                    functionArguments = functionArguments == null ? null :functionArguments.replace("\n", "\\n");
+
+                                    // Create new function with copied values
+                                    newFunction = new DashScopeApiSpec.ChatCompletionMessage.ChatCompletionFunction(functionName, functionArguments);
+                                }
+
+                                // Create new tool call with copied values
+                                DashScopeApiSpec.ChatCompletionMessage.ToolCall newToolCall = new DashScopeApiSpec.ChatCompletionMessage.ToolCall(id, type, newFunction, originalToolCall.index());
+                                newToolCalls.add(newToolCall);
+                            }
+                        }
+
+                        // Create new message with copied values
+                        newMessage = new DashScopeApiSpec.ChatCompletionMessage(rawContent, role, name, toolCallId, newToolCalls,
+                                originalChoice.message().reasoningContent(), originalChoice.message().partial(), originalChoice.message().phase(),
+                                originalChoice.message().annotations(), originalChoice.message().status());
+                    }
+
+                    // Create new choice with copied values
+                    DashScopeApiSpec.ChatCompletionOutput.Choice newChoice = new DashScopeApiSpec.ChatCompletionOutput.Choice(finishReason, newMessage, originalChoice.logprobs());
+                    newChoices.add(newChoice);
+                }
+            }
+
+            // Create new output with copied values
+            newOutput = new DashScopeApiSpec.ChatCompletionOutput(originalText, newChoices, originalChunk.output().searchInfo());
+        }
+
+        // Create and return new chunk
+        return new DashScopeApiSpec.ChatCompletionChunk(requestId, newOutput, usage, o);
+    }
+
+    /**
+     * Creates rerank request for dashscope rerank model.
+     *
+     * @param rerankRequest The chat completion request.
+     * @return Entity response with {@link DashScopeApiSpec.ChatCompletion} as a body and HTTP status code
+     * and headers.
+     */
+    public ResponseEntity<DashScopeApiSpec.RerankResponse> rerankEntity(DashScopeApiSpec.RerankRequest rerankRequest) {
+        Assert.notNull(rerankRequest, "The request body can not be null.");
 
 		return this.restClient.post()
 			.uri(this.rerankPath)

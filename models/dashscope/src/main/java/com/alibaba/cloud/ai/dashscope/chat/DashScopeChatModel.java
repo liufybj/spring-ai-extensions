@@ -80,12 +80,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
-import java.util.ArrayList;
-import java.util.Base64;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
@@ -283,15 +278,28 @@ public class DashScopeChatModel implements ChatModel {
 
 			// Convert the ChatCompletionChunk into a ChatCompletion to be able to reuse
 			// the function call handling logic.
-			Flux<ChatResponse> chatResponse = completionChunks.map(this::chunkToChatCompletion).switchMap(
-                    chatCompletion -> Mono.just(chatCompletion)
-                            .map(chatCompletion2 -> toChatResponse(
-                                    chatCompletion2,
-                                    previousChatResponse,
-                                    request,
-                                    roleMap
-                            ))
-            );
+            Flux<ChatResponse> chatResponse = completionChunks.map(this::chunkToChatCompletion)
+                    .switchMap(chatCompletion -> Mono.just(chatCompletion)
+                            .map(chatCompletion2 -> toChatResponse(chatCompletion2, previousChatResponse, request, roleMap)))
+                    .filter(response -> {
+                        if (response == null) {
+                            return false;
+                        }
+                        if (response.hasToolCalls()) {
+                            if (ToolCallingChatOptions.isInternalToolExecutionEnabled(prompt.getOptions())) {
+                                if (org.apache.commons.lang3.StringUtils.isNotEmpty(response.getResults().get(0).getOutput().getToolCalls().get(0).name())
+                                        && response.hasFinishReasons(Set.of("TOOL_CALLS", "TOOL_CALL"))) {
+                                    return true;
+                                } else {
+                                    return false;
+                                }
+                            } else {
+                                return true;
+                            }
+                        } else {
+                            return true;
+                        }
+                    });
 
 			Flux<ChatResponse> flux = chatResponse.flatMap(response -> {
 					if (toolExecutionEligibilityPredicate.isToolExecutionRequired(prompt.getOptions(), response)) {
@@ -412,7 +420,11 @@ public class DashScopeChatModel implements ChatModel {
 				.map(toolCall -> new AssistantMessage.ToolCall(toolCall.id(), "function",
 						toolCall.function().name(), toolCall.function().arguments()))
 				.toList();
-
+        // modified by liufy 注释掉，支持工具调用流式输出
+        //					if (toolCall.function().name() == null) {
+        //						logger.warn("Filtering out toolCall with null function name: {}", toolCall);
+        //						return false;
+        //					}
 		String finishReason = finishReasonToMetadataValue(choice.finishReason());
 		var generationMetadataBuilder = ChatGenerationMetadata.builder().finishReason(finishReason);
 
@@ -554,16 +566,18 @@ public class DashScopeChatModel implements ChatModel {
 			else if (message.getMessageType() == MessageType.TOOL) {
 				ToolResponseMessage toolMessage = (ToolResponseMessage) message;
 
-				toolMessage.getResponses().forEach(response -> {
-					Assert.isTrue(response.id() != null, "ToolResponseMessage must have an id");
-					Assert.isTrue(response.name() != null, "ToolResponseMessage must have a name");
-				});
+				// modified by liufy 过滤掉id和name为null的
+//				toolMessage.getResponses().forEach(response -> {
+//					Assert.isTrue(response.id() != null, "ToolResponseMessage must have an id");
+//					Assert.isTrue(response.name() != null, "ToolResponseMessage must have a name");
+//				});
 
 				return toolMessage.getResponses()
-					.stream()
-					.map(tr -> new ChatCompletionMessage(tr.responseData(), ChatCompletionMessage.Role.TOOL, tr.name(),
-							tr.id(), null, null, null, null, null, null))
-					.toList();
+						.stream()
+						.filter(response -> response.id() != null && response.name() != null)
+						.map(tr -> new ChatCompletionMessage(tr.responseData(), ChatCompletionMessage.Role.TOOL, tr.name(),
+								tr.id(), null, null, null, null, null, null))
+						.toList();
 			}
 			else {
 				throw new IllegalArgumentException("Unsupported message type: " + message.getMessageType());

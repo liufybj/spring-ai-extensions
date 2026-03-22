@@ -19,7 +19,7 @@
     <parent>
         <groupId>com.alibaba.cloud.ai</groupId>
         <artifactId>spring-ai-alibaba-extensions</artifactId>
-        <version>${revision}</version>
+        <version>1.1.0-msea3</version>
         <relativePath>../../pom.xml</relativePath>
     </parent>
 
@@ -56,12 +56,12 @@
         <dependency>
             <groupId>com.alibaba.cloud.ai</groupId>
             <artifactId>spring-ai-alibaba-autoconfigure-memory-long</artifactId>
-            <version>${revision}</version>
+            <version>1.1.0-msea3</version>
         </dependency>
         <dependency>
             <groupId>com.alibaba.cloud.ai</groupId>
             <artifactId>spring-ai-alibaba-starter-memory-mem0</artifactId>
-            <version>${revision}</version>
+            <version>1.1.0-msea3</version>
         </dependency>
     </dependencies>
 
